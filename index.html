@@ -327,6 +327,16 @@ table.data-table { width: 100%; border-collapse: collapse; font-size: .87rem; }
 </head>
 <body>
 
+<!-- Auth Loading Overlay -->
+<div id="auth-loading" style="position:fixed;inset:0;background:var(--canvas);display:flex;align-items:center;justify-content:center;z-index:9999;transition:opacity .3s;">
+  <div style="text-align:center;">
+    <div style="width:40px;height:40px;border:3px solid var(--line);border-top-color:var(--thread);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px;"></div>
+    <div style="color:var(--ink-soft);font-size:.85rem;font-weight:600;">Loading...</div>
+  </div>
+</div>
+<style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+
+
 <div id="login-screen" class="auth-screen">
   <div class="auth-card stitch-top">
     <div class="brand-mark" style="margin-bottom:18px;">
@@ -932,6 +942,8 @@ const secondaryApp = firebase.initializeApp(firebaseConfig, "Secondary");
 const secondaryAuth = secondaryApp.auth();
 
 const auth = firebase.auth();
+// Keep user logged in across browser restarts / tab closes
+auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(err => console.error("Auth persistence failed:", err));
 const db = firebase.firestore();
 const storage = firebase.storage();
 const functionsInstance = firebase.functions ? firebase.functions() : null;
@@ -1495,22 +1507,31 @@ document.addEventListener("DOMContentLoaded", () => {
   bindForms();
   applySiteSettings();
 
+  let authInitDone = false;
   auth.onAuthStateChanged(async (user) => {
-    if (user) {
-      const wSnap = await db.collection(FIRESTORE.workers).doc(user.uid).get();
-      if (!wSnap.exists) { showToast("Worker record not found. Contact Admin.", true); auth.signOut(); return; }
-      const w = wSnap.data();
-      if (w.active === false) { showToast("Your account is deactivated. Contact Admin.", true); auth.signOut(); return; }
-      currentWorker = { uid: user.uid, ...w };
-      showApp();
-      loadAll();
-      startPresenceHeartbeat();
-      setupAutoLogout(30, () => { auth.signOut(); showToast("Logged out due to inactivity"); });
-    } else {
-      currentWorker = null;
-      stopPresenceHeartbeat();
-      document.getElementById("app-shell").classList.add("hidden");
-      document.getElementById("login-screen").classList.remove("hidden");
+    try {
+      if (user) {
+        const wSnap = await db.collection(FIRESTORE.workers).doc(user.uid).get();
+        if (!wSnap.exists) { showToast("Worker record not found. Contact Admin.", true); auth.signOut(); hideAuthLoading(); return; }
+        const w = wSnap.data();
+        if (w.active === false) { showToast("Your account is deactivated. Contact Admin.", true); auth.signOut(); hideAuthLoading(); return; }
+        currentWorker = { uid: user.uid, ...w };
+        showApp();
+        await loadAll();
+        startPresenceHeartbeat();
+        setupAutoLogout(30, () => { auth.signOut(); showToast("Logged out due to inactivity"); });
+      } else {
+        currentWorker = null;
+        stopPresenceHeartbeat();
+        document.getElementById("app-shell").classList.add("hidden");
+        document.getElementById("login-screen").classList.remove("hidden");
+      }
+    } catch (err) {
+      console.error("Auth state error:", err);
+      showToast("Login error: " + (err.message || err), true);
+      auth.signOut();
+    } finally {
+      if (!authInitDone) { authInitDone = true; hideAuthLoading(); }
     }
   });
 });
@@ -1533,6 +1554,10 @@ function stopPresenceHeartbeat() {
 function showApp() {
   document.getElementById("login-screen").classList.add("hidden");
   document.getElementById("app-shell").classList.remove("hidden");
+}
+function hideAuthLoading() {
+  const el = document.getElementById("auth-loading");
+  if (el) { el.style.opacity = "0"; setTimeout(() => el.remove(), 350); }
 }
 
 function bindLogin() {
@@ -1659,12 +1684,20 @@ function bindForms() {
 }
 
 async function loadAll() {
-  const setting = await db.collection(FIRESTORE.settings).doc("general").get();
-  rateGlobal = setting.exists ? (setting.data().ratePerDozen || 0) : 0;
+  try {
+    const setting = await db.collection(FIRESTORE.settings).doc("general").get();
+    rateGlobal = setting.exists ? (setting.data().ratePerDozen || 0) : 0;
 
-  await Promise.all([loadProduction(), loadPayments(), loadProfile(), loadNotifications()]);
-  renderDashboard();
-  renderHistory();
+    await Promise.all([loadProduction(), loadPayments(), loadProfile(), loadNotifications()]);
+    renderDashboard();
+    renderHistory();
+  } catch (err) {
+    console.error("loadAll failed:", err);
+    showToast("Dashboard load failed. Check console / Firestore rules.", true);
+    // Render empty states so page isn't blank
+    renderDashboard();
+    renderHistory();
+  }
 }
 
 async function loadProduction() {
@@ -1711,21 +1744,27 @@ function loadProfile() {
 }
 
 async function loadNotifications() {
-  const snap = await db.collection(FIRESTORE.notices).orderBy("date", "desc").limit(30).get();
-  const list = document.getElementById("notif-list");
-  list.innerHTML = "";
-  let unread = 0;
-  snap.forEach(doc => {
-    const n = doc.data();
-    if (n.target && n.target !== "all" && n.target !== currentWorker.workerId) return;
-    unread++;
-    const div = document.createElement("div");
-    div.className = "stitch-divider";
-    div.innerHTML = `<strong>${n.title}</strong><div class="text-muted" style="font-size:.82rem;margin:4px 0;">${n.message}</div><div class="text-muted" style="font-size:.72rem;">${fmtDate(n.date)}</div>`;
-    list.appendChild(div);
-  });
-  document.getElementById("topbar-notif-dot").classList.toggle("show", unread > 0);
-  if (!snap.size) list.innerHTML = `<p class="text-muted">No notifications yet.</p>`;
+  try {
+    const snap = await db.collection(FIRESTORE.notices).orderBy("date", "desc").limit(30).get();
+    const list = document.getElementById("notif-list");
+    list.innerHTML = "";
+    let unread = 0;
+    snap.forEach(doc => {
+      const n = doc.data();
+      if (n.target && n.target !== "all" && n.target !== currentWorker.workerId) return;
+      unread++;
+      const div = document.createElement("div");
+      div.className = "stitch-divider";
+      div.innerHTML = `<strong>${n.title}</strong><div class="text-muted" style="font-size:.82rem;margin:4px 0;">${n.message}</div><div class="text-muted" style="font-size:.72rem;">${fmtDate(n.date)}</div>`;
+      list.appendChild(div);
+    });
+    document.getElementById("topbar-notif-dot").classList.toggle("show", unread > 0);
+    if (!snap.size) list.innerHTML = `<p class="text-muted">No notifications yet.</p>`;
+  } catch (err) {
+    console.error("loadNotifications failed:", err);
+    document.getElementById("notif-list").innerHTML = `<p class="text-muted">Unable to load notifications.</p>`;
+    showToast("Failed to load notifications. Check Firestore rules.", true);
+  }
 }
 
 function approvedProduction() { return productionCache.filter(p => p.status === "approved"); }
